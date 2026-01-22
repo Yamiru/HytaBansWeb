@@ -1,0 +1,31 @@
+# robots.txt for HytaBansWeb
+User-agent: *
+Allow: /
+Allow: /bans
+Allow: /mutes
+Allow: /warnings
+Allow: /kicks
+Allow: /stats
+Allow: /protest
+Allow: /search
+Allow: /player
+Allow: /assets/
+
+Disallow: /admin
+Disallow: /config/
+Disallow: /core/
+Disallow: /controllers/
+Disallow: /lang/
+Disallow: /data/
+Disallow: /templates/
+Disallow: /.env
+Disallow: /hash.php
+Disallow: /install.php
+Disallow: /install-demos.php
+Disallow: /debug.php
+
+# Sitemap location
+Sitemap: https://yoursite.com/sitemap.xml
+
+# Crawl-delay
+Crawl-delay: 1

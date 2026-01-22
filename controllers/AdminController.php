@@ -1,0 +1,1880 @@
+<?php
+/**
+ * ============================================================================
+ *  HytaBansWeb
+ * ============================================================================
+ *
+ *  Plugin Name:   HytaBansWeb
+ *  Description:   A modern, secure, and responsive web interface for HytaBans punishment management system.
+ *  Version:       3.7
+ *  Repository:    https://github.com/Yamiru/HytaBansWeb
+ *  Author URI:    https://yamiru.com
+ *  License:       MIT
+ *  License URI:   https://opensource.org/licenses/MIT
+ * ============================================================================
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/../core/AuthManager.php';
+
+class AdminController extends BaseController
+{
+    private const ADMIN_SESSION_TIMEOUT = 7200; // 2 hours (increased from 1 hour)
+    private const MAX_LOGIN_ATTEMPTS = 5;
+    private const LOGIN_LOCKOUT_TIME = 900; // 15 minutes
+    
+    private ?\core\AuthManager $authManager = null;
+    
+    private function getAuthManager(): \core\AuthManager
+    {
+        if ($this->authManager === null) {
+            $this->authManager = new \core\AuthManager($this->config);
+        }
+        return $this->authManager;
+    }
+    
+    public function index(): void
+    {
+        // Check if admin is enabled
+        if (!($this->config['admin_enabled'] ?? false)) {
+            $this->redirect(url('/'));
+            return;
+        }
+        
+        // Check authentication
+        if (!$this->isAuthenticated()) {
+            $this->showLoginForm();
+            return;
+        }
+        
+        // Log admin access
+        $this->logAdminAction('dashboard_access', 'Accessed admin dashboard');
+        
+        // Get current user for dashboard
+        $currentUser = $this->getCurrentUser();
+        
+        // Show admin dashboard
+        $this->render('admin/dashboard', [
+            'title' => $this->lang->get('admin.dashboard'),
+            'currentPage' => 'admin',
+            'controller' => $this,
+            'stats' => $this->repository->getStats(),
+            'currentUser' => $currentUser,
+            'authManager' => $this->getAuthManager()
+        ]);
+    }
+    
+    public function login(): void
+    {
+        if (!SecurityManager::validateRequestMethod('POST')) {
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Check if password login is allowed
+        $allowPasswordLogin = $this->config['allow_password_login'] ?? true;
+        $googleAuthEnabled = $this->config['google_auth_enabled'] ?? false;
+        
+        if ($googleAuthEnabled && !$allowPasswordLogin) {
+            $_SESSION['admin_error'] = 'Password login is disabled. Please use Google authentication.';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Validate CSRF token
+        if (!SecurityManager::validateCsrfToken($_POST['csrf_token'] ?? '')) {
+            $_SESSION['admin_error'] = 'Invalid security token';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Check login attempts
+        if (!$this->checkLoginAttempts()) {
+            $_SESSION['admin_error'] = 'Too many login attempts. Please try again later.';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        $password = $_POST['password'] ?? '';
+        
+        // Verify password
+        $adminPassword = $this->config['admin_password'] ?? '';
+        if (empty($adminPassword) || !password_verify($password, $adminPassword)) {
+            $this->incrementLoginAttempts();
+            $_SESSION['admin_error'] = 'Invalid password';
+            $this->logAdminAction('login_failed', 'Failed login attempt', ['severity' => 'warning']);
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Set admin session
+        $_SESSION['admin_authenticated'] = true;
+        $_SESSION['admin_login_time'] = time();
+        $_SESSION['admin_user'] = 'Administrator';
+        
+        // Clear login attempts
+        $this->clearLoginAttempts();
+        
+        // Log successful login
+        $this->logAdminAction('login_success', 'Successfully logged in');
+        
+        // Check for redirect after login (require_login feature)
+        $redirectUrl = $_SESSION['redirect_after_login'] ?? null;
+        unset($_SESSION['redirect_after_login']);
+        
+        if ($redirectUrl && strpos($redirectUrl, '/admin') !== 0) {
+            $this->redirect($redirectUrl);
+        } else {
+            $this->redirect(url('admin'));
+        }
+    }
+    
+    public function logout(): void
+    {
+        $this->logAdminAction('logout', 'Logged out');
+        
+        unset($_SESSION['admin_authenticated']);
+        unset($_SESSION['admin_login_time']);
+        unset($_SESSION['admin_user']);
+        
+        $this->redirect(url('/'));
+    }
+    
+    public function searchPunishments(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        $input = json_decode(file_get_contents('php://input'), true);
+        $query = trim($input['query'] ?? '');
+        $type = $input['type'] ?? '';
+        
+        try {
+            if (empty($query) || strlen($query) < 1) {
+                $this->jsonResponse(['success' => true, 'punishments' => []]);
+                return;
+            }
+            
+            // Enhanced search that handles both names and UUIDs
+            $punishments = $this->performAdvancedSearch($query, $type);
+            
+            // Sort by time descending
+            usort($punishments, function($a, $b) {
+                return ($b['time'] ?? 0) <=> ($a['time'] ?? 0);
+            });
+            
+            // Format punishments with enhanced data
+            $formatted = array_map(function($p) {
+                // Get player name more reliably
+                $playerName = $p['player_name'] ?? null;
+                if (!$playerName && !empty($p['uuid']) && $p['uuid'] !== '#') {
+                    $playerName = $this->repository->getPlayerName($p['uuid']);
+                }
+                
+                return [
+                    'id' => (int)$p['id'],
+                    'type' => rtrim($p['type'], 's'), // Normalize to singular
+                    'player_name' => $playerName ?? 'Unknown',
+                    'uuid' => $p['uuid'] ?? '',
+                    'reason' => $p['reason'] ?? 'No reason provided',
+                    'staff' => $p['banned_by_name'] ?? 'Console',
+                    'date' => $this->formatDate((int)($p['time'] ?? 0)),
+                    'active' => (bool)($p['active'] ?? false),
+                    'until' => isset($p['until']) && $p['until'] > 0 
+                        ? $this->formatDate((int)$p['until']) 
+                        : null,
+                    'server' => $p['server_origin'] ?? $p['server_scope'] ?? 'Global'
+                ];
+            }, array_slice($punishments, 0, 100)); // Increase limit to 100 results
+            
+            $this->logAdminAction('search_punishments', "Searched for '{$query}' in {$type}", [
+                'query' => $query,
+                'type' => $type,
+                'results_count' => count($formatted)
+            ]);
+            
+            $this->jsonResponse(['success' => true, 'punishments' => $formatted]);
+            
+        } catch (Exception $e) {
+            error_log("Admin search error: " . $e->getMessage());
+            $this->jsonResponse(['error' => 'Search failed: ' . $e->getMessage()], 500);
+        }
+    }
+    
+    private function performAdvancedSearch(string $query, string $type): array
+    {
+        $results = [];
+        $currentTime = time();
+        
+        // Determine which tables to search
+        if (!empty($type)) {
+            $tables = [$type];
+        } else {
+            $tables = ['bans', 'mutes', 'warnings', 'kicks'];
+        }
+        
+        // Check if query is numeric (for direct ID match)
+        $isNumeric = is_numeric($query);
+        
+        // Check if query is a UUID
+        $isUuid = !$isNumeric && SecurityManager::validateUuid($query);
+        
+        foreach ($tables as $table) {
+            $fullTable = $this->repository->getTablePrefix() . $table;
+            
+            try {
+                if ($table === 'kicks') {
+                    // Kicks don't have active status
+                    $sql = "SELECT '{$table}' as type, id, player_uuid as uuid, player_name,
+                                   reason, issued_by_name as banned_by_name, created_at as time,
+                                   0 as active
+                            FROM {$fullTable}
+                            WHERE 1=1";
+                } else {
+                    $sql = "SELECT '{$table}' as type, id, player_uuid as uuid, player_name,
+                                   reason, issued_by_name as banned_by_name, created_at as time,
+                                   expires_at as until, permanent, removed,
+                                   CASE 
+                                       WHEN removed = 1 THEN 0
+                                       WHEN permanent = 1 THEN 1
+                                       WHEN expires_at IS NULL THEN 1
+                                       WHEN expires_at > :current_time THEN 1
+                                       ELSE 0
+                                   END as active
+                            FROM {$fullTable}
+                            WHERE 1=1";
+                }
+                
+                $params = [];
+                if ($table !== 'kicks') {
+                    $params[':current_time'] = $currentTime;
+                }
+                
+                // Build WHERE conditions
+                $conditions = [];
+                
+                if ($isNumeric) {
+                    // Search by ID
+                    $conditions[] = "id = :id";
+                    $params[':id'] = (int)$query;
+                } elseif ($isUuid) {
+                    // Search by UUID
+                    $conditions[] = "player_uuid = :uuid";
+                    $params[':uuid'] = $query;
+                } else {
+                    // Search by name, reason, or staff
+                    $conditions[] = "(LOWER(player_name) LIKE LOWER(:query) 
+                                   OR LOWER(reason) LIKE LOWER(:query2) 
+                                   OR LOWER(issued_by_name) LIKE LOWER(:query3)
+                                   OR player_uuid LIKE :query4)";
+                    $params[':query'] = '%' . $query . '%';
+                    $params[':query2'] = '%' . $query . '%';
+                    $params[':query3'] = '%' . $query . '%';
+                    $params[':query4'] = '%' . $query . '%';
+                }
+                
+                if (!empty($conditions)) {
+                    $sql .= " AND (" . implode(" OR ", $conditions) . ")";
+                }
+                
+                $sql .= " ORDER BY created_at DESC LIMIT 50";
+                
+                $stmt = $this->repository->getConnection()->prepare($sql);
+                $stmt->execute($params);
+                
+                $tableResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                $results = array_merge($results, $tableResults);
+                
+            } catch (Exception $e) {
+                error_log("Admin search error for table {$table}: " . $e->getMessage());
+            }
+        }
+        
+        return $results;
+    }
+    
+    public function removePunishment(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        // Check if user has permission to remove punishments (admin or moderator only)
+        $currentUser = $this->getCurrentUser();
+        $userRole = $currentUser['role'] ?? 'admin';
+        if ($userRole === 'viewer') {
+            $this->jsonResponse(['error' => 'Permission denied. Viewers cannot remove punishments.'], 403);
+            return;
+        }
+        
+        $input = json_decode(file_get_contents('php://input'), true);
+        $type = $input['type'] ?? '';
+        $id = (int)($input['id'] ?? 0);
+        
+        if (!in_array($type, ['ban', 'mute', 'warning', 'kick'])) {
+            $this->jsonResponse(['error' => 'Invalid punishment type'], 400);
+            return;
+        }
+        
+        // Convert to table name
+        $tableName = $type . 's';
+        
+        try {
+            // Check if punishment exists and is active
+            $checkSql = "SELECT id, active, uuid FROM {$this->repository->getTablePrefix()}{$tableName} WHERE id = :id";
+            $stmt = $this->repository->getConnection()->prepare($checkSql);
+            $stmt->execute([':id' => $id]);
+            $punishment = $stmt->fetch();
+            
+            if (!$punishment) {
+                $this->jsonResponse(['error' => 'Punishment not found'], 404);
+                return;
+            }
+            
+            if (!$punishment['active']) {
+                $this->jsonResponse(['error' => 'Punishment is already inactive'], 400);
+                return;
+            }
+            
+            // Remove the punishment
+            $table = $this->repository->getTablePrefix() . $tableName;
+            $sql = "UPDATE {$table} SET 
+                    active = 0,
+                    removed_by_name = :removed_by,
+                    removed_by_date = :removed_date
+                    WHERE id = :id";
+            
+            $stmt = $this->repository->getConnection()->prepare($sql);
+            $result = $stmt->execute([
+                ':removed_by' => $_SESSION['admin_user'] ?? 'Admin',
+                ':removed_date' => time() * 1000,
+                ':id' => $id
+            ]);
+            
+            if ($result) {
+                // Get player name for logging
+                $playerName = $this->repository->getPlayerName($punishment['uuid'] ?? '');
+                
+                $this->logAdminAction('remove_punishment', "Removed {$type} #{$id} for player {$playerName}", [
+                    'punishment_id' => $id,
+                    'punishment_type' => $type,
+                    'player_uuid' => $punishment['uuid'] ?? '',
+                    'player_name' => $playerName
+                ]);
+                
+                $this->jsonResponse(['success' => true, 'message' => 'Punishment removed successfully']);
+            } else {
+                $this->jsonResponse(['error' => 'Failed to update punishment'], 500);
+            }
+            
+        } catch (Exception $e) {
+            error_log("Remove punishment error: " . $e->getMessage());
+            $this->jsonResponse(['error' => 'Database error occurred'], 500);
+        }
+    }
+    
+    public function modifyReason(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        // Check if user has permission to modify punishments (admin or moderator only)
+        $currentUser = $this->getCurrentUser();
+        $userRole = $currentUser['role'] ?? 'admin';
+        if ($userRole === 'viewer') {
+            $this->jsonResponse(['error' => 'Permission denied. Viewers cannot modify punishments.'], 403);
+            return;
+        }
+        
+        $input = json_decode(file_get_contents('php://input'), true);
+        $type = $input['type'] ?? '';
+        $id = (int)($input['id'] ?? 0);
+        $newReason = trim($input['reason'] ?? '');
+        
+        if (!in_array($type, ['ban', 'mute', 'warning', 'kick'])) {
+            $this->jsonResponse(['error' => 'Invalid punishment type'], 400);
+            return;
+        }
+        
+        if (empty($newReason)) {
+            $this->jsonResponse(['error' => 'Reason cannot be empty'], 400);
+            return;
+        }
+        
+        // Convert to table name
+        $tableName = $type . 's';
+        
+        try {
+            // Check if punishment exists
+            $checkSql = "SELECT id, uuid, reason FROM {$this->repository->getTablePrefix()}{$tableName} WHERE id = :id";
+            $stmt = $this->repository->getConnection()->prepare($checkSql);
+            $stmt->execute([':id' => $id]);
+            $punishment = $stmt->fetch();
+            
+            if (!$punishment) {
+                $this->jsonResponse(['error' => 'Punishment not found'], 404);
+                return;
+            }
+            
+            $oldReason = $punishment['reason'];
+            
+            // Update the reason
+            $table = $this->repository->getTablePrefix() . $tableName;
+            $sql = "UPDATE {$table} SET reason = :reason WHERE id = :id";
+            
+            $stmt = $this->repository->getConnection()->prepare($sql);
+            $result = $stmt->execute([
+                ':reason' => $newReason,
+                ':id' => $id
+            ]);
+            
+            if ($result) {
+                // Get player name for logging
+                $playerName = $this->repository->getPlayerName($punishment['uuid'] ?? '');
+                
+                $this->logAdminAction('modify_reason', "Modified reason for {$type} #{$id} for player {$playerName}", [
+                    'punishment_id' => $id,
+                    'punishment_type' => $type,
+                    'player_uuid' => $punishment['uuid'] ?? '',
+                    'player_name' => $playerName,
+                    'old_reason' => $oldReason,
+                    'new_reason' => $newReason
+                ]);
+                
+                $this->jsonResponse(['success' => true, 'message' => 'Reason updated successfully']);
+            } else {
+                $this->jsonResponse(['error' => 'Failed to update reason'], 500);
+            }
+            
+        } catch (Exception $e) {
+            error_log("Modify reason error: " . $e->getMessage());
+            $this->jsonResponse(['error' => 'Database error occurred'], 500);
+        }
+    }
+    
+    public function saveSettings(): void
+    {
+        // Start output buffering to catch any unexpected output
+        ob_start();
+        
+        if (!$this->isAuthenticated()) {
+            ob_end_clean();
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        // Validate CSRF token
+        if (!SecurityManager::validateCsrfToken($_POST['csrf_token'] ?? '')) {
+            ob_end_clean();
+            $this->jsonResponse(['error' => 'Invalid security token'], 400);
+            return;
+        }
+        
+        try {
+            // Only update settings that are actually submitted
+            $settings = [];
+            
+            // Only add settings if they exist in POST
+            if (isset($_POST['site_name'])) {
+                $settings['SITE_NAME'] = $_POST['site_name'];
+            }
+            if (isset($_POST['footer_site_name'])) {
+                $settings['FOOTER_SITE_NAME'] = $_POST['footer_site_name'];
+            }
+            if (isset($_POST['items_per_page'])) {
+                $settings['ITEMS_PER_PAGE'] = (int)$_POST['items_per_page'];
+            }
+            if (isset($_POST['timezone'])) {
+                $settings['TIMEZONE'] = $_POST['timezone'];
+            }
+            if (isset($_POST['date_format'])) {
+                $settings['DATE_FORMAT'] = $_POST['date_format'];
+            }
+            if (isset($_POST['default_theme'])) {
+                $settings['DEFAULT_THEME'] = $_POST['default_theme'];
+            }
+            
+            // Checkboxes - only update if form was submitted with these fields
+            $settings['SHOW_PLAYER_UUID'] = isset($_POST['show_player_uuid']) ? 'true' : 'false';
+            
+            // Protest Settings
+            if (isset($_POST['protest_discord'])) {
+                $settings['PROTEST_DISCORD'] = $_POST['protest_discord'];
+            }
+            if (isset($_POST['protest_email'])) {
+                $settings['PROTEST_EMAIL'] = $_POST['protest_email'];
+            }
+            if (isset($_POST['protest_forum'])) {
+                $settings['PROTEST_FORUM'] = $_POST['protest_forum'];
+            }
+            
+            // Google Auth Settings
+            $settings['GOOGLE_AUTH_ENABLED'] = isset($_POST['google_auth_enabled']) ? 'true' : 'false';
+            if (isset($_POST['google_client_id'])) {
+                $settings['GOOGLE_CLIENT_ID'] = $_POST['google_client_id'];
+            }
+            if (isset($_POST['google_client_secret'])) {
+                $settings['GOOGLE_CLIENT_SECRET'] = $_POST['google_client_secret'];
+            }
+            $settings['ALLOW_PASSWORD_LOGIN'] = isset($_POST['allow_password_login']) ? 'true' : 'false';
+            
+            // Display Options
+            $settings['SHOW_SILENT_PUNISHMENTS'] = isset($_POST['show_silent_punishments']) ? 'true' : 'false';
+            $settings['SHOW_SERVER_ORIGIN'] = isset($_POST['show_server_origin']) ? 'true' : 'false';
+            $settings['SHOW_SERVER_SCOPE'] = isset($_POST['show_server_scope']) ? 'true' : 'false';
+            $settings['SHOW_CONTACT_DISCORD'] = isset($_POST['show_contact_discord']) ? 'true' : 'false';
+            $settings['SHOW_CONTACT_EMAIL'] = isset($_POST['show_contact_email']) ? 'true' : 'false';
+            $settings['SHOW_CONTACT_FORUM'] = isset($_POST['show_contact_forum']) ? 'true' : 'false';
+            $settings['SHOW_MENU_PROTEST'] = isset($_POST['show_menu_protest']) ? 'true' : 'false';
+            $settings['SHOW_MENU_STATS'] = isset($_POST['show_menu_stats']) ? 'true' : 'false';
+            
+            // Require Login - all pages require authentication
+            $settings['REQUIRE_LOGIN'] = isset($_POST['require_login']) ? 'true' : 'false';
+            
+            // SEO Settings
+            $settings['SEO_ENABLE_SCHEMA'] = isset($_POST['seo_enable_schema']) ? 'true' : 'false';
+            if (isset($_POST['seo_organization_name'])) {
+                $settings['SEO_ORGANIZATION_NAME'] = $_POST['seo_organization_name'];
+            }
+            if (isset($_POST['seo_organization_logo'])) {
+                $settings['SEO_ORGANIZATION_LOGO'] = $_POST['seo_organization_logo'];
+            }
+            if (isset($_POST['seo_social_facebook'])) {
+                $settings['SEO_SOCIAL_FACEBOOK'] = $_POST['seo_social_facebook'];
+            }
+            if (isset($_POST['seo_social_twitter'])) {
+                $settings['SEO_SOCIAL_TWITTER'] = $_POST['seo_social_twitter'];
+            }
+            if (isset($_POST['seo_social_youtube'])) {
+                $settings['SEO_SOCIAL_YOUTUBE'] = $_POST['seo_social_youtube'];
+            }
+            if (isset($_POST['seo_contact_email'])) {
+                $settings['SEO_CONTACT_EMAIL'] = $_POST['seo_contact_email'];
+            }
+            if (isset($_POST['seo_contact_phone'])) {
+                $settings['SEO_CONTACT_PHONE'] = $_POST['seo_contact_phone'];
+            }
+            if (isset($_POST['seo_locale'])) {
+                $settings['SEO_LOCALE'] = $_POST['seo_locale'];
+            }
+            if (isset($_POST['seo_geo_region'])) {
+                $settings['SEO_GEO_REGION'] = $_POST['seo_geo_region'];
+            }
+            if (isset($_POST['seo_geo_placename'])) {
+                $settings['SEO_GEO_PLACENAME'] = $_POST['seo_geo_placename'];
+            }
+            $settings['SEO_AI_TRAINING'] = isset($_POST['seo_ai_training']) ? 'true' : 'false';
+            
+            // Additional Site Settings
+            if (isset($_POST['site_url'])) {
+                $settings['SITE_URL'] = $_POST['site_url'];
+            }
+            if (isset($_POST['site_lang'])) {
+                $settings['SITE_LANG'] = $_POST['site_lang'];
+            }
+            if (isset($_POST['site_description'])) {
+                $settings['SITE_DESCRIPTION'] = $_POST['site_description'];
+            }
+            if (isset($_POST['site_title_template'])) {
+                $settings['SITE_TITLE_TEMPLATE'] = $_POST['site_title_template'];
+            }
+            if (isset($_POST['site_keywords'])) {
+                $settings['SITE_KEYWORDS'] = $_POST['site_keywords'];
+            }
+            if (isset($_POST['site_robots'])) {
+                $settings['SITE_ROBOTS'] = $_POST['site_robots'];
+            }
+            if (isset($_POST['site_theme_color'])) {
+                $settings['SITE_THEME_COLOR'] = $_POST['site_theme_color'];
+            }
+            if (isset($_POST['site_og_image'])) {
+                $settings['SITE_OG_IMAGE'] = $_POST['site_og_image'];
+            }
+            if (isset($_POST['site_twitter_site'])) {
+                $settings['SITE_TWITTER_SITE'] = $_POST['site_twitter_site'];
+            }
+            if (isset($_POST['default_language'])) {
+                $settings['DEFAULT_LANGUAGE'] = $_POST['default_language'];
+            }
+            
+            // Avatar Settings - save URLs directly
+            if (isset($_POST['avatar_url'])) {
+                $settings['AVATAR_URL'] = $_POST['avatar_url'];
+            }
+            if (isset($_POST['avatar_url_offline'])) {
+                $settings['AVATAR_URL_OFFLINE'] = $_POST['avatar_url_offline'];
+            }
+            
+            // Update .env file - only update provided settings
+            $envFile = BASE_DIR . '/.env';
+            
+            // Check if .env file exists and is writable
+            if (!file_exists($envFile)) {
+                ob_end_clean();
+                $this->jsonResponse(['error' => '.env file not found'], 500);
+                return;
+            }
+            
+            if (!is_writable($envFile)) {
+                ob_end_clean();
+                $this->jsonResponse(['error' => '.env file is not writable. Check file permissions.'], 500);
+                return;
+            }
+            
+            $envContent = file_get_contents($envFile);
+            if ($envContent === false) {
+                ob_end_clean();
+                $this->jsonResponse(['error' => 'Failed to read .env file'], 500);
+                return;
+            }
+            
+            foreach ($settings as $key => $value) {
+                // Convert value to string
+                $value = (string)$value;
+                $pattern = "/^" . preg_quote($key, '/') . "=.*/m";
+                $replacement = "{$key}={$value}";
+                
+                if (preg_match($pattern, $envContent)) {
+                    $envContent = preg_replace($pattern, $replacement, $envContent);
+                } else {
+                    $envContent .= "\n{$key}={$value}";
+                }
+            }
+            
+            // Write with lock to prevent race conditions
+            $result = file_put_contents($envFile, $envContent, LOCK_EX);
+            if ($result === false) {
+                ob_end_clean();
+                $this->jsonResponse(['error' => 'Failed to write to .env file'], 500);
+                return;
+            }
+            
+            // Force reload .env to apply changes immediately
+            \core\EnvLoader::reload();
+            
+            // Clear opcache to force reload of .env and config files
+            if (function_exists('opcache_reset')) {
+                opcache_reset();
+            }
+            
+            // Clear APCu cache if available
+            if (function_exists('apcu_clear_cache')) {
+                apcu_clear_cache();
+            }
+            
+            // Reload config to apply new environment values
+            $this->config = require BASE_DIR . '/config/app.php';
+            
+            // Set cookie for show_uuid preference
+            setcookie('show_uuid', $settings['SHOW_PLAYER_UUID'], [
+                'expires' => time() + 86400 * 365,
+                'path' => BASE_PATH ?: '/',
+                'secure' => isset($_SERVER['HTTPS']),
+                'httponly' => true,
+                'samesite' => 'Lax'
+            ]);
+            
+            $this->logAdminAction('settings_update', 'Updated system settings', [
+                'updated_settings' => array_keys($settings)
+            ]);
+            
+            ob_end_clean();
+            $this->jsonResponse([
+                'success' => true, 
+                'message' => 'Settings saved successfully!',
+                'reload_recommended' => true
+            ]);
+            
+        } catch (\Exception $e) {
+            $unexpectedOutput = ob_get_clean();
+            error_log("Save settings error: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
+            if ($unexpectedOutput) {
+                error_log("Unexpected output before error: " . $unexpectedOutput);
+            }
+            $this->jsonResponse(['error' => 'Failed to save settings: ' . $e->getMessage()], 500);
+        }
+    }
+    
+    /**
+     * Keep-alive endpoint to prevent session timeout
+     */
+    public function keepAlive(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['authenticated' => false], 401);
+            return;
+        }
+        
+        // Session is automatically refreshed by isAuthenticated()
+        $this->jsonResponse([
+            'authenticated' => true,
+            'timestamp' => time()
+        ]);
+    }
+    
+    public function export(): void
+    {
+        if (!$this->isAuthenticated()) {
+            http_response_code(401);
+            exit('Unauthorized');
+        }
+        
+        $format = $_GET['format'] ?? 'json';
+        $type = $_GET['type'] ?? 'all';
+        $filter = $_GET['filter'] ?? 'all'; // New: 'all' or 'active'
+        
+        $this->logAdminAction('data_export', "Exported $type data as $format (filter: $filter)");
+        
+        $data = $this->gatherExportData($type, $filter);
+        
+        switch ($format) {
+            case 'json':
+                $this->exportJson($data, $type);
+                break;
+            case 'xml':
+                $this->exportXml($data, $type);
+                break;
+            case 'csv':
+                $this->exportCsv($data, $type);
+                break;
+            default:
+                http_response_code(400);
+                exit('Invalid format');
+        }
+    }
+    
+    public function import(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        // Validate CSRF token
+        if (!SecurityManager::validateCsrfToken($_POST['csrf_token'] ?? '')) {
+            $this->jsonResponse(['error' => 'Invalid security token'], 400);
+            return;
+        }
+        
+        if (!isset($_FILES['import_file']) || $_FILES['import_file']['error'] !== UPLOAD_ERR_OK) {
+            $this->jsonResponse(['error' => 'No file uploaded'], 400);
+            return;
+        }
+        
+        $file = $_FILES['import_file'];
+        $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        
+        if (!in_array($extension, ['json', 'xml'])) {
+            $this->jsonResponse(['error' => 'Invalid file format'], 400);
+            return;
+        }
+        
+        try {
+            $content = file_get_contents($file['tmp_name']);
+            $imported = 0;
+            
+            if ($extension === 'json') {
+                $data = json_decode($content, true);
+                if ($data === null) {
+                    throw new Exception('Invalid JSON format');
+                }
+                $imported = $this->importData($data);
+            } else {
+                // XML import
+                $xml = simplexml_load_string($content);
+                if ($xml === false) {
+                    throw new Exception('Invalid XML format');
+                }
+                $data = json_decode(json_encode($xml), true);
+                $imported = $this->importData($data);
+            }
+            
+            $this->logAdminAction('data_import', "Imported $imported records from {$file['name']}");
+            
+            $this->jsonResponse(['success' => true, 'imported' => $imported]);
+            
+        } catch (Exception $e) {
+            error_log("Import error: " . $e->getMessage());
+            $this->jsonResponse(['error' => $e->getMessage()], 500);
+        }
+    }
+    
+    public function phpinfo(): void
+    {
+        if (!$this->isAuthenticated()) {
+            http_response_code(401);
+            exit;
+        }
+        
+        $section = $_GET['section'] ?? 'general';
+        
+        ob_start();
+        
+        switch ($section) {
+            case 'general':
+                phpinfo(INFO_GENERAL);
+                break;
+            case 'configuration':
+                phpinfo(INFO_CONFIGURATION);
+                break;
+            case 'modules':
+                phpinfo(INFO_MODULES);
+                break;
+            case 'environment':
+                phpinfo(INFO_ENVIRONMENT);
+                break;
+            case 'variables':
+                phpinfo(INFO_VARIABLES);
+                break;
+            default:
+                phpinfo(INFO_GENERAL);
+        }
+        
+        $phpinfo = ob_get_clean();
+        
+        // Extract just the body content
+        preg_match('/<body[^>]*>(.*?)<\/body>/si', $phpinfo, $matches);
+        $content = $matches[1] ?? $phpinfo;
+        
+        // Apply custom styling
+        $content = str_replace(
+            ['<table', '<h1', '<h2', 'class="e"', 'class="v"', 'class="h"'],
+            ['<table class="table table-sm"', '<h3', '<h4', 'class="text-muted"', '', 'class="table-active"'],
+            $content
+        );
+        
+        echo $content;
+        exit;
+    }
+    
+    // Helper Methods - Changed from private to public
+    
+    public function isAuthenticated(): bool
+    {
+        if (!isset($_SESSION['admin_authenticated'])) {
+            return false;
+        }
+        
+        // Check session timeout
+        if (time() - ($_SESSION['admin_login_time'] ?? 0) > self::ADMIN_SESSION_TIMEOUT) {
+            unset($_SESSION['admin_authenticated']);
+            unset($_SESSION['admin_user_id']);
+            return false;
+        }
+        
+        // Refresh session time on activity
+        $_SESSION['admin_login_time'] = time();
+        
+        return true;
+    }
+    
+    /**
+     * Get current logged in user
+     */
+    public function getCurrentUser(): ?array
+    {
+        if (!$this->isAuthenticated()) {
+            return null;
+        }
+        
+        // If Google Auth is enabled and user has ID
+        if (isset($_SESSION['admin_user_id'])) {
+            return $this->getAuthManager()->getUserById($_SESSION['admin_user_id']);
+        }
+        
+        // Legacy password auth
+        return [
+            'id' => 'legacy',
+            'name' => $_SESSION['admin_user'] ?? 'Administrator',
+            'email' => '',
+            'role' => 'admin',
+            'permissions' => ['all'],
+            'picture' => ''
+        ];
+    }
+    
+    /**
+     * Check if current user has permission
+     */
+    public function hasPermission(string $permission): bool
+    {
+        $user = $this->getCurrentUser();
+        if (!$user) {
+            return false;
+        }
+        
+        // Legacy admin has all permissions
+        if ($user['id'] === 'legacy') {
+            return true;
+        }
+        
+        return $this->getAuthManager()->hasPermission($user, $permission);
+    }
+    
+    private function checkLoginAttempts(): bool
+    {
+        $ip = SecurityManager::getClientIp();
+        $attempts = $_SESSION['login_attempts'][$ip] ?? 0;
+        $lastAttempt = $_SESSION['last_login_attempt'][$ip] ?? 0;
+        
+        if ($attempts >= self::MAX_LOGIN_ATTEMPTS) {
+            if (time() - $lastAttempt < self::LOGIN_LOCKOUT_TIME) {
+                return false;
+            }
+            // Reset after lockout period
+            unset($_SESSION['login_attempts'][$ip]);
+            unset($_SESSION['last_login_attempt'][$ip]);
+        }
+        
+        return true;
+    }
+    
+    private function incrementLoginAttempts(): void
+    {
+        $ip = SecurityManager::getClientIp();
+        $_SESSION['login_attempts'][$ip] = ($_SESSION['login_attempts'][$ip] ?? 0) + 1;
+        $_SESSION['last_login_attempt'][$ip] = time();
+    }
+    
+    private function clearLoginAttempts(): void
+    {
+        $ip = SecurityManager::getClientIp();
+        unset($_SESSION['login_attempts'][$ip]);
+        unset($_SESSION['last_login_attempt'][$ip]);
+    }
+    
+    private function showLoginForm(): void
+    {
+        $authManager = $this->getAuthManager();
+        $allowPasswordLogin = $this->config['allow_password_login'] ?? true;
+        
+        // Show password login if: not using OAuth, or explicitly allowed, and password is set
+        $showPasswordLogin = ((!$authManager->isGoogleAuthEnabled() && !$authManager->isDiscordAuthEnabled()) || $allowPasswordLogin) 
+                             && !empty($this->config['admin_password']);
+        
+        // Check if any users exist (for first user message)
+        $hasUsers = count($authManager->getAllUsers()) > 0;
+        
+        $this->render('admin/login', [
+            'title' => $this->lang->get('admin.login'),
+            'error' => $_SESSION['admin_error'] ?? null,
+            'currentPage' => 'admin',
+            'googleAuthEnabled' => $authManager->isGoogleAuthEnabled(),
+            'googleAuthUrl' => $authManager->isGoogleAuthEnabled() ? $authManager->getGoogleAuthUrl() : '',
+            'discordAuthEnabled' => $authManager->isDiscordAuthEnabled(),
+            'discordAuthUrl' => $authManager->isDiscordAuthEnabled() ? $authManager->getDiscordAuthUrl() : '',
+            'showPasswordLogin' => $showPasswordLogin,
+            'allowPasswordLogin' => $allowPasswordLogin,
+            'hasUsers' => $hasUsers
+        ]);
+        
+        unset($_SESSION['admin_error']);
+    }
+    
+    /**
+     * Google OAuth callback
+     */
+    public function oauthCallback(): void
+    {
+        $authManager = $this->getAuthManager();
+        // Default to google for backward compatibility (when no provider param)
+        $provider = $_GET['provider'] ?? 'google';
+        
+        // Validate provider
+        if (!in_array($provider, ['google', 'discord'])) {
+            $_SESSION['admin_error'] = 'Invalid OAuth provider';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Check if provider is enabled
+        if ($provider === 'google' && !$authManager->isGoogleAuthEnabled()) {
+            $_SESSION['admin_error'] = 'Google authentication is not enabled';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        if ($provider === 'discord' && !$authManager->isDiscordAuthEnabled()) {
+            $_SESSION['admin_error'] = 'Discord authentication is not enabled';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        $code = $_GET['code'] ?? '';
+        $error = $_GET['error'] ?? '';
+        
+        if ($error) {
+            $_SESSION['admin_error'] = ucfirst($provider) . ' login was cancelled or failed';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        if (empty($code)) {
+            $_SESSION['admin_error'] = 'Invalid OAuth response';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Process OAuth callback based on provider
+        if ($provider === 'google') {
+            $oauthUser = $authManager->processGoogleCallback($code);
+            $user = $oauthUser ? $authManager->authenticateGoogle($oauthUser) : null;
+        } else {
+            $oauthUser = $authManager->processDiscordCallback($code);
+            $user = $oauthUser ? $authManager->authenticateDiscord($oauthUser) : null;
+        }
+        
+        if (!$oauthUser) {
+            $_SESSION['admin_error'] = 'Failed to authenticate with ' . ucfirst($provider);
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        if (!$user) {
+            $_SESSION['admin_error'] = 'You are not authorized to access the admin panel. Contact an administrator.';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        if (!($user['active'] ?? true)) {
+            $_SESSION['admin_error'] = 'Your account has been deactivated';
+            $this->redirect(url('admin'));
+            return;
+        }
+        
+        // Set session
+        $_SESSION['admin_authenticated'] = true;
+        $_SESSION['admin_login_time'] = time();
+        $_SESSION['admin_user'] = $user['name'];
+        $_SESSION['admin_user_id'] = $user['id'];
+        
+        $this->logAdminAction($provider . '_login_success', 'Successfully logged in via ' . ucfirst($provider), [
+            'user_id' => $user['id'],
+            'email' => $user['email']
+        ]);
+        
+        // Check for redirect after login (require_login feature)
+        $redirectUrl = $_SESSION['redirect_after_login'] ?? null;
+        unset($_SESSION['redirect_after_login']);
+        
+        if ($redirectUrl && strpos($redirectUrl, '/admin') !== 0) {
+            $this->redirect($redirectUrl);
+        } else {
+            $this->redirect(url('admin'));
+        }
+    }
+    
+    /**
+     * Get all users (API)
+     */
+    public function getUsers(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        if (!$this->hasPermission('users')) {
+            $this->jsonResponse(['error' => 'Permission denied'], 403);
+            return;
+        }
+        
+        $users = $this->getAuthManager()->getAllUsers();
+        $this->jsonResponse(['success' => true, 'users' => $users]);
+    }
+    
+    /**
+     * Add new user
+     */
+    public function addUser(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        if (!$this->hasPermission('users')) {
+            $this->jsonResponse(['error' => 'Permission denied'], 403);
+            return;
+        }
+        
+        $input = json_decode(file_get_contents('php://input'), true);
+        $email = trim($input['email'] ?? '');
+        $name = trim($input['name'] ?? '');
+        $role = $input['role'] ?? 'viewer';
+        
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $this->jsonResponse(['error' => 'Valid email is required'], 400);
+            return;
+        }
+        
+        // Check if email already exists
+        if ($this->getAuthManager()->getUserByEmail($email)) {
+            $this->jsonResponse(['error' => 'User with this email already exists'], 400);
+            return;
+        }
+        
+        $roles = \core\AuthManager::getRoles();
+        if (!isset($roles[$role])) {
+            $role = 'viewer';
+        }
+        
+        $user = $this->getAuthManager()->createUser([
+            'email' => $email,
+            'name' => $name ?: $email,
+            'role' => $role,
+            'permissions' => $roles[$role]['permissions']
+        ]);
+        
+        $this->logAdminAction('user_created', "Created user {$email}", [
+            'user_id' => $user['id'],
+            'email' => $email,
+            'role' => $role
+        ]);
+        
+        $this->jsonResponse(['success' => true, 'user' => $user]);
+    }
+    
+    /**
+     * Update user
+     */
+    public function updateUser(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        if (!$this->hasPermission('users')) {
+            $this->jsonResponse(['error' => 'Permission denied'], 403);
+            return;
+        }
+        
+        $input = json_decode(file_get_contents('php://input'), true);
+        $userId = $input['id'] ?? '';
+        $name = trim($input['name'] ?? '');
+        $role = $input['role'] ?? '';
+        $active = $input['active'] ?? true;
+        
+        if (empty($userId)) {
+            $this->jsonResponse(['error' => 'User ID is required'], 400);
+            return;
+        }
+        
+        $user = $this->getAuthManager()->getUserById($userId);
+        if (!$user) {
+            $this->jsonResponse(['error' => 'User not found'], 404);
+            return;
+        }
+        
+        // Cannot demote the last admin
+        $roles = \core\AuthManager::getRoles();
+        if ($user['role'] === 'admin' && $role !== 'admin' && $this->getAuthManager()->countAdmins() <= 1) {
+            $this->jsonResponse(['error' => 'Cannot demote the last administrator'], 400);
+            return;
+        }
+        
+        $updates = [];
+        if (!empty($name)) {
+            $updates['name'] = $name;
+        }
+        if (!empty($role) && isset($roles[$role])) {
+            $updates['role'] = $role;
+            $updates['permissions'] = $roles[$role]['permissions'];
+        }
+        $updates['active'] = (bool)$active;
+        
+        $this->getAuthManager()->updateUser($userId, $updates);
+        
+        $this->logAdminAction('user_updated', "Updated user {$user['email']}", [
+            'user_id' => $userId,
+            'updates' => array_keys($updates)
+        ]);
+        
+        $this->jsonResponse(['success' => true]);
+    }
+    
+    /**
+     * Delete user
+     */
+    public function deleteUser(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        if (!$this->hasPermission('users')) {
+            $this->jsonResponse(['error' => 'Permission denied'], 403);
+            return;
+        }
+        
+        $input = json_decode(file_get_contents('php://input'), true);
+        $userId = $input['id'] ?? '';
+        
+        if (empty($userId)) {
+            $this->jsonResponse(['error' => 'User ID is required'], 400);
+            return;
+        }
+        
+        // Cannot delete yourself
+        if ($userId === ($_SESSION['admin_user_id'] ?? '')) {
+            $this->jsonResponse(['error' => 'Cannot delete your own account'], 400);
+            return;
+        }
+        
+        $user = $this->getAuthManager()->getUserById($userId);
+        if (!$user) {
+            $this->jsonResponse(['error' => 'User not found'], 404);
+            return;
+        }
+        
+        if (!$this->getAuthManager()->deleteUser($userId)) {
+            $this->jsonResponse(['error' => 'Cannot delete the last administrator'], 400);
+            return;
+        }
+        
+        $this->logAdminAction('user_deleted', "Deleted user {$user['email']}", [
+            'user_id' => $userId,
+            'email' => $user['email']
+        ]);
+        
+        $this->jsonResponse(['success' => true]);
+    }
+    
+    private function gatherExportData(string $type, string $filter = 'all'): array
+    {
+        $data = [];
+        
+        if ($type === 'all') {
+            $types = ['bans', 'mutes', 'warnings', 'kicks'];
+        } else {
+            $types = [$type];
+        }
+        
+        foreach ($types as $t) {
+            $table = $this->repository->getTablePrefix() . $t;
+            
+            // Build query based on filter
+            $whereClause = "WHERE uuid IS NOT NULL AND uuid != '#'";
+            if ($filter === 'active' && in_array($t, ['bans', 'mutes'])) {
+                $whereClause .= " AND active = 1";
+            }
+            
+            $sql = "SELECT * FROM {$table} {$whereClause} ORDER BY time DESC";
+            $stmt = $this->repository->getConnection()->query($sql);
+            $data[$t] = $stmt->fetchAll();
+        }
+        
+        return $data;
+    }
+    
+    private function exportJson(array $data, string $type): void
+    {
+        header('Content-Type: application/json');
+        header('Content-Disposition: attachment; filename="hb_' . $type . '_' . date('Y-m-d') . '.json"');
+        
+        echo json_encode($data, JSON_PRETTY_PRINT);
+        exit;
+    }
+    
+    private function exportXml(array $data, string $type): void
+    {
+        header('Content-Type: text/xml');
+        header('Content-Disposition: attachment; filename="hb_' . $type . '_' . date('Y-m-d') . '.xml"');
+        
+        $xml = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><hytabans></hytabans>');
+        
+        foreach ($data as $table => $rows) {
+            $tableNode = $xml->addChild($table);
+            foreach ($rows as $row) {
+                $itemNode = $tableNode->addChild('item');
+                foreach ($row as $key => $value) {
+                    $itemNode->addChild($key, htmlspecialchars((string)$value));
+                }
+            }
+        }
+        
+        echo $xml->asXML();
+        exit;
+    }
+    
+    private function exportCsv(array $data, string $type): void
+    {
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="hb_' . $type . '_' . date('Y-m-d') . '.csv"');
+        
+        $output = fopen('php://output', 'w');
+        
+        foreach ($data as $table => $rows) {
+            if (empty($rows)) continue;
+            
+            // Write table name
+            fputcsv($output, ["Table: $table"]);
+            
+            // Write headers
+            fputcsv($output, array_keys($rows[0]));
+            
+            // Write data
+            foreach ($rows as $row) {
+                fputcsv($output, array_values($row));
+            }
+            
+            // Empty line between tables
+            fputcsv($output, []);
+        }
+        
+        fclose($output);
+        exit;
+    }
+    
+    private function importData(array $data): int
+    {
+        $imported = 0;
+        
+        foreach ($data as $table => $rows) {
+            if (!is_array($rows)) continue;
+            
+            $tableName = $this->repository->getTablePrefix() . $table;
+            
+            foreach ($rows as $row) {
+                if (!is_array($row)) continue;
+                
+                try {
+                    // Check if record exists
+                    $sql = "SELECT id FROM {$tableName} WHERE id = :id";
+                    $stmt = $this->repository->getConnection()->prepare($sql);
+                    $stmt->execute([':id' => $row['id'] ?? 0]);
+                    
+                    if ($stmt->fetch()) {
+                        // Update existing
+                        $this->updateRecord($tableName, $row);
+                    } else {
+                        // Insert new
+                        $this->insertRecord($tableName, $row);
+                    }
+                    
+                    $imported++;
+                } catch (Exception $e) {
+                    error_log("Import record error: " . $e->getMessage());
+                }
+            }
+        }
+        
+        return $imported;
+    }
+    
+    private function insertRecord(string $table, array $data): void
+    {
+        $columns = array_keys($data);
+        $placeholders = array_map(function($col) { return ':' . $col; }, $columns);
+        
+        $sql = "INSERT INTO {$table} (" . implode(', ', $columns) . ") VALUES (" . implode(', ', $placeholders) . ")";
+        
+        $stmt = $this->repository->getConnection()->prepare($sql);
+        foreach ($data as $key => $value) {
+            $stmt->bindValue(':' . $key, $value);
+        }
+        $stmt->execute();
+    }
+    
+    private function updateRecord(string $table, array $data): void
+    {
+        $id = $data['id'];
+        unset($data['id']);
+        
+        $sets = array_map(function($col) { return $col . ' = :' . $col; }, array_keys($data));
+        
+        $sql = "UPDATE {$table} SET " . implode(', ', $sets) . " WHERE id = :id";
+        
+        $stmt = $this->repository->getConnection()->prepare($sql);
+        $stmt->bindValue(':id', $id);
+        foreach ($data as $key => $value) {
+            $stmt->bindValue(':' . $key, $value);
+        }
+        $stmt->execute();
+    }
+    
+    private function logAdminAction(string $action, string $description, array $details = []): void
+    {
+        try {
+            // Create admin_logs table if it doesn't exist
+            $sql = "CREATE TABLE IF NOT EXISTS {$this->repository->getTablePrefix()}admin_logs (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        user VARCHAR(255),
+                        ip VARCHAR(45),
+                        action_type VARCHAR(50),
+                        description TEXT,
+                        details JSON,
+                        severity VARCHAR(20) DEFAULT 'info'
+                    )";
+            $this->repository->getConnection()->exec($sql);
+            
+            // Insert log entry
+            $sql = "INSERT INTO {$this->repository->getTablePrefix()}admin_logs 
+                    (user, ip, action_type, description, details, severity) 
+                    VALUES (:user, :ip, :action, :desc, :details, :severity)";
+                    
+            $stmt = $this->repository->getConnection()->prepare($sql);
+            $stmt->execute([
+                ':user' => $_SESSION['admin_user'] ?? 'System',
+                ':ip' => SecurityManager::getClientIp(),
+                ':action' => $action,
+                ':desc' => $description,
+                ':details' => json_encode($details),
+                ':severity' => $details['severity'] ?? 'info'
+            ]);
+        } catch (PDOException $e) {
+            error_log("Failed to log admin action: " . $e->getMessage());
+        }
+    }
+    
+    // Add missing methods
+    public function getDatabaseSize(): string
+    {
+        try {
+            $dbName = $this->config['db_name'] ?? 'hytabans';
+            $sql = "SELECT 
+                    ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
+                    FROM information_schema.tables
+                    WHERE table_schema = :dbname
+                    AND table_name LIKE :prefix";
+                    
+            $stmt = $this->repository->getConnection()->prepare($sql);
+            $stmt->execute([
+                ':dbname' => $dbName,
+                ':prefix' => $this->repository->getTablePrefix() . '%'
+            ]);
+            
+            $result = $stmt->fetch();
+            return ($result['size_mb'] ?? 0) . ' MB';
+        } catch (Exception $e) {
+            return 'Unknown';
+        }
+    }
+    
+    public function getStats(): array
+    {
+        return $this->repository->getStats();
+    }
+    
+    /**
+     * Diagnostic endpoint - shows current avatar config
+     */
+    public function diagnosticAvatar(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        try {
+            // Read .env file directly
+            $envFile = BASE_DIR . '/.env';
+            $envContent = file_get_contents($envFile);
+            
+            // Extract avatar settings from .env
+            $envAvatarProvider = null;
+            $envAvatarUrl = null;
+            $envAvatarUrlOffline = null;
+            
+            if (preg_match('/^AVATAR_PROVIDER=(.*)$/m', $envContent, $matches)) {
+                $envAvatarProvider = trim($matches[1]);
+            }
+            if (preg_match('/^AVATAR_URL=(.*)$/m', $envContent, $matches)) {
+                $envAvatarUrl = trim($matches[1]);
+            }
+            if (preg_match('/^AVATAR_URL_OFFLINE=(.*)$/m', $envContent, $matches)) {
+                $envAvatarUrlOffline = trim($matches[1]);
+            }
+            
+            // Get from EnvLoader
+            $envLoaderProvider = \core\EnvLoader::get('AVATAR_PROVIDER');
+            $envLoaderUrl = \core\EnvLoader::get('AVATAR_URL');
+            $envLoaderUrlOffline = \core\EnvLoader::get('AVATAR_URL_OFFLINE');
+            
+            // Get from current config
+            $configProvider = $this->config['avatar_provider'] ?? null;
+            $configUrl = $this->config['avatar_url'] ?? null;
+            $configUrlOffline = $this->config['avatar_url_offline'] ?? null;
+            
+            // Test getAvatarUrl
+            $testUuid = '069a79f4-44e9-4726-a5be-fca90e38aaf5'; // Notch
+            $testName = 'Notch';
+            $testAvatarUrl = $this->getAvatarUrl($testUuid, $testName);
+            
+            // Check if opcache is enabled
+            $opcacheEnabled = function_exists('opcache_get_status') && opcache_get_status();
+            $apcuEnabled = function_exists('apcu_cache_info') && apcu_enabled();
+            
+            $this->jsonResponse([
+                'success' => true,
+                'timestamp' => date('Y-m-d H:i:s'),
+                'env_file' => [
+                    'exists' => file_exists($envFile),
+                    'readable' => is_readable($envFile),
+                    'writable' => is_writable($envFile),
+                    'avatar_provider' => $envAvatarProvider,
+                    'avatar_url' => $envAvatarUrl,
+                    'avatar_url_offline' => $envAvatarUrlOffline
+                ],
+                'env_loader' => [
+                    'avatar_provider' => $envLoaderProvider,
+                    'avatar_url' => $envLoaderUrl,
+                    'avatar_url_offline' => $envLoaderUrlOffline
+                ],
+                'config_array' => [
+                    'avatar_provider' => $configProvider,
+                    'avatar_url' => $configUrl,
+                    'avatar_url_offline' => $configUrlOffline
+                ],
+                'test_avatar' => [
+                    'uuid' => $testUuid,
+                    'name' => $testName,
+                    'generated_url' => $testAvatarUrl
+                ],
+                'cache_status' => [
+                    'opcache_enabled' => $opcacheEnabled,
+                    'apcu_enabled' => $apcuEnabled
+                ],
+                'recommendation' => $this->getAvatarDiagnosticRecommendation(
+                    $envAvatarProvider,
+                    $envLoaderProvider,
+                    $configProvider,
+                    $testAvatarUrl
+                )
+            ]);
+            
+        } catch (Exception $e) {
+            $this->jsonResponse([
+                'success' => false,
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+    
+    private function getAvatarDiagnosticRecommendation(
+        ?string $envProvider,
+        ?string $loaderProvider,
+        ?string $configProvider,
+        string $testUrl
+    ): string {
+        if ($envProvider !== $loaderProvider) {
+            return 'EnvLoader is not reading from .env correctly. Reload EnvLoader or restart PHP-FPM.';
+        }
+        
+        if ($loaderProvider !== $configProvider) {
+            return 'Config is not loading from EnvLoader. Clear OPcache and reload config.';
+        }
+        
+        // Check if test URL matches expected provider
+        if ($configProvider === 'mineatar' && strpos($testUrl, 'mineatar.io') === false) {
+            return 'getAvatarUrl() is not using the correct provider. Config is not being applied to BaseController.';
+        }
+        
+        if ($configProvider === 'crafatar' && strpos($testUrl, 'crafatar.com') === false) {
+            return 'getAvatarUrl() is not using the correct provider. Config is not being applied to BaseController.';
+        }
+        
+        if ($configProvider === 'cravatar' && strpos($testUrl, 'cravatar.eu') === false) {
+            return 'getAvatarUrl() is not using the correct provider. Config is not being applied to BaseController.';
+        }
+        
+        return 'All settings match correctly. Clear browser cache (Ctrl+F5) if avatars still appear old.';
+    }
+    
+    /**
+     * Test database structure and timestamps
+     */
+    public function testDatabase(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        try {
+            $results = [
+                'success' => true,
+                'tables' => [],
+                'timestamp_test' => [],
+                'warnings' => []
+            ];
+            
+            $tables = ['bans', 'mutes', 'warnings', 'kicks', 'history'];
+            
+            // Test each table
+            foreach ($tables as $tableName) {
+                $fullTable = $this->repository->getTablePrefix() . $tableName;
+                
+                try {
+                    // Check if table exists
+                    $stmt = $this->repository->getConnection()->query(
+                        "SHOW TABLES LIKE '" . $fullTable . "'"
+                    );
+                    $exists = $stmt->rowCount() > 0;
+                    
+                    if (!$exists) {
+                        $results['tables'][$tableName] = [
+                            'exists' => false,
+                            'status' => 'missing'
+                        ];
+                        $results['warnings'][] = "Table {$fullTable} does not exist";
+                        continue;
+                    }
+                    
+                    // Get column info
+                    $stmt = $this->repository->getConnection()->query(
+                        "DESCRIBE {$fullTable}"
+                    );
+                    $columns = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    $hasTime = false;
+                    $hasUntil = false;
+                    
+                    foreach ($columns as $col) {
+                        if ($col['Field'] === 'time') $hasTime = true;
+                        if ($col['Field'] === 'until') $hasUntil = true;
+                    }
+                    
+                    // Test timestamp if this table has time/until columns
+                    if ($hasTime && in_array($tableName, ['bans', 'mutes'])) {
+                        $stmt = $this->repository->getConnection()->query(
+                            "SELECT time, until, active FROM {$fullTable} ORDER BY time DESC LIMIT 1"
+                        );
+                        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        if ($row) {
+                            $timeInSeconds = intval($row['time'] / 1000);
+                            $untilInSeconds = $row['until'] > 0 ? intval($row['until'] / 1000) : 0;
+                            
+                            $results['timestamp_test'][$tableName] = [
+                                'raw_time' => $row['time'],
+                                'time_seconds' => $timeInSeconds,
+                                'time_date' => date('Y-m-d H:i:s', $timeInSeconds),
+                                'raw_until' => $row['until'],
+                                'until_seconds' => $untilInSeconds,
+                                'until_date' => $untilInSeconds > 0 ? date('Y-m-d H:i:s', $untilInSeconds) : 'Permanent',
+                                'active' => $row['active'],
+                                'is_valid' => $timeInSeconds > 0 && $timeInSeconds < 2147483647
+                            ];
+                            
+                            // Check for invalid timestamps
+                            if ($timeInSeconds <= 0) {
+                                $results['warnings'][] = "Invalid timestamp in {$tableName}: time={$row['time']}";
+                            }
+                            
+                            if ($untilInSeconds > 0 && $untilInSeconds < $timeInSeconds) {
+                                $results['warnings'][] = "Until time is before start time in {$tableName}";
+                            }
+                        }
+                    }
+                    
+                    $results['tables'][$tableName] = [
+                        'exists' => true,
+                        'status' => 'ok',
+                        'has_time' => $hasTime,
+                        'has_until' => $hasUntil,
+                        'columns' => count($columns)
+                    ];
+                    
+                } catch (PDOException $e) {
+                    $results['tables'][$tableName] = [
+                        'exists' => false,
+                        'status' => 'error',
+                        'error' => $e->getMessage()
+                    ];
+                    $results['warnings'][] = "Error testing {$tableName}: " . $e->getMessage();
+                }
+            }
+            
+            // Test current time
+            $results['server_info'] = [
+                'php_time' => time(),
+                'php_time_ms' => time() * 1000,
+                'php_date' => date('Y-m-d H:i:s'),
+                'timezone' => date_default_timezone_get()
+            ];
+            
+            $this->jsonResponse($results);
+            
+        } catch (Exception $e) {
+            $this->jsonResponse([
+                'success' => false,
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+    
+    /**
+     * Clear all caches including opcache
+     */
+    public function clearAllCache(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['error' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        // Validate CSRF token
+        if (!SecurityManager::validateCsrfToken($_POST['csrf_token'] ?? '')) {
+            $this->jsonResponse(['error' => 'Invalid security token'], 400);
+            return;
+        }
+        
+        try {
+            $cleared = [];
+            
+            // Clear opcache
+            if (function_exists('opcache_reset')) {
+                opcache_reset();
+                $cleared[] = 'OPcache';
+            }
+            
+            // Reload .env
+            \core\EnvLoader::reload();
+            $cleared[] = 'Environment config';
+            
+            // Clear APCu if available
+            if (function_exists('apcu_clear_cache')) {
+                apcu_clear_cache();
+                $cleared[] = 'APCu cache';
+            }
+            
+            $this->logAdminAction('cache_clear', 'Cleared all caches', [
+                'caches' => $cleared
+            ]);
+            
+            $this->jsonResponse([
+                'success' => true,
+                'message' => 'All caches cleared successfully',
+                'cleared' => $cleared
+            ]);
+            
+        } catch (Exception $e) {
+            error_log("Clear cache error: " . $e->getMessage());
+            $this->jsonResponse(['error' => 'Failed to clear caches'], 500);
+        }
+    }
+    
+    /**
+     * Check latest version on GitHub
+     */
+    public function checkGitHubVersion(): void
+    {
+        try {
+            // GitHub repository info
+            $owner = 'Yamiru';
+            $repo = 'HytaBansWeb';
+            
+            // Try to read .version file from GitHub main branch
+            $url = "https://raw.githubusercontent.com/{$owner}/{$repo}/main/.version";
+            
+            // Set timeout and user agent
+            $context = stream_context_create([
+                'http' => [
+                    'timeout' => 5,
+                    'user_agent' => 'HytaBansWeb-Version-Checker'
+                ]
+            ]);
+            
+            // Fetch version from GitHub
+            $githubVersion = @file_get_contents($url, false, $context);
+            
+            if ($githubVersion === false) {
+                $this->jsonResponse([
+                    'success' => false,
+                    'error' => 'Could not fetch GitHub version'
+                ]);
+                return;
+            }
+            
+            // Read local version
+            $localVersion = file_exists(BASE_DIR . '/.version') 
+                ? trim(file_get_contents(BASE_DIR . '/.version')) 
+                : '3.3';
+            
+            $githubVersion = trim($githubVersion);
+            
+            // Compare versions
+            $updateAvailable = version_compare($githubVersion, $localVersion, '>');
+            
+            $this->jsonResponse([
+                'success' => true,
+                'local_version' => $localVersion,
+                'github_version' => $githubVersion,
+                'update_available' => $updateAvailable
+            ]);
+            
+        } catch (Exception $e) {
+            error_log("GitHub version check error: " . $e->getMessage());
+            $this->jsonResponse([
+                'success' => false,
+                'error' => 'Failed to check GitHub version'
+            ]);
+        }
+    }
+    
+    /**
+     * Generate sitemap XML for SEO
+     */
+    public function generateSitemap(): string
+    {
+        $baseUrl = rtrim($this->config['site_url'] ?? 'https://yoursite.com', '/');
+        $currentDate = date('Y-m-d\TH:i:sP');
+        
+        $urls = [
+            ['loc' => '/', 'priority' => '1.0'],
+            ['loc' => '/bans', 'priority' => '0.9'],
+            ['loc' => '/mutes', 'priority' => '0.9'],
+            ['loc' => '/warnings', 'priority' => '0.8'],
+            ['loc' => '/kicks', 'priority' => '0.7'],
+            ['loc' => '/stats', 'priority' => '0.8'],
+            ['loc' => '/protest', 'priority' => '0.6'],
+        ];
+        
+        $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+        $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"' . "\n";
+        $xml .= '        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"' . "\n";
+        $xml .= '        xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9' . "\n";
+        $xml .= '        http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">' . "\n";
+        
+        foreach ($urls as $url) {
+            $xml .= "    <url>\n";
+            $xml .= "        <loc>" . htmlspecialchars($baseUrl . $url['loc'], ENT_XML1, 'UTF-8') . "</loc>\n";
+            $xml .= "        <lastmod>{$currentDate}</lastmod>\n";
+            $xml .= "        <priority>" . htmlspecialchars($url['priority'], ENT_XML1, 'UTF-8') . "</priority>\n";
+            $xml .= "    </url>\n";
+        }
+        
+        $xml .= "</urlset>";
+        
+        return $xml;
+    }
+    
+    /**
+     * Get staff statistics for admin panel
+     */
+    public function getStaffStats(): void
+    {
+        if (!$this->isAuthenticated()) {
+            $this->jsonResponse(['success' => false, 'message' => 'Unauthorized'], 401);
+            return;
+        }
+        
+        try {
+            $stats = $this->repository->getStaffStatistics(20);
+            $this->jsonResponse(['success' => true, 'stats' => $stats]);
+        } catch (Exception $e) {
+            error_log("Error getting staff stats: " . $e->getMessage());
+            $this->jsonResponse(['success' => false, 'message' => 'Server error'], 500);
+        }
+    }
+}

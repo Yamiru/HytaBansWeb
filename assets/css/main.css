@@ -1,0 +1,30 @@
+/**
+ * ============================================================================
+ * HytaBansWeb
+ * ============================================================================
+ *
+ * Plugin Name:   HytaBansWeb
+ * Description:   A modern, secure, and responsive web interface for HytaBans punishment management system.
+ * Version:       1.0
+ * Repository:    https://github.com/Yamiru/HytaBansWeb
+ * Author URI:    https://yamiru.com
+ * License:       MIT
+ * License URI:   https://opensource.org/licenses/MIT
+ * Repository:    https://github.com/Yamiru/HytaBansWeb
+ * ============================================================================
+ */
+/* Import modular CSS files */
+@import url('variables.css');
+@import url('base.css');
+@import url('components.css');
+@import url('layout.css');
+@import url('themes.css');
+@import url('utilities.css');
+@import url('responsive.css');
+
+/* Page-specific styles */
+@import url('pages/home.css');
+@import url('pages/stats.css');
+@import url('pages/punishments.css');
+@import url('pages/detail.css');
+@import url('pages/admin.css');
