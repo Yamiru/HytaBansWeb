@@ -6,7 +6,7 @@
  *
  *  Plugin Name:   HytaBansWeb
  *  Description:   A modern, secure, and responsive web interface for HytaBans punishment management system.
- *  Version:       1.0
+ *  Version:       1.1
  *  Repository:    https://github.com/Yamiru/HytaBansWeb
  *  Author URI:    https://yamiru.com
  *  License:       MIT
@@ -39,11 +39,16 @@ try {
     die('Failed to load environment: ' . $e->getMessage());
 }
 
+// Detect HTTPS properly (including behind proxy)
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') 
+        || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
+        || (!empty($_SERVER['REQUEST_SCHEME']) && $_SERVER['REQUEST_SCHEME'] === 'https');
+
 // Session start with security
 session_start([
     'cookie_httponly' => true,
-    'cookie_secure' => isset($_SERVER['HTTPS']),
-    'cookie_samesite' => 'Strict',
+    'cookie_secure' => $isHttps,
+    'cookie_samesite' => 'Lax', // Lax required for OAuth redirects
     'use_strict_mode' => true,
     'gc_maxlifetime' => (int)core\EnvLoader::get('SESSION_LIFETIME', 3600),
     'sid_length' => 48,
