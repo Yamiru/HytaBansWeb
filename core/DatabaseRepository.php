@@ -6,7 +6,7 @@
  *
  *  Plugin Name:   HytaBansWeb
  *  Description:   A modern, secure, and responsive web interface for HytaBans punishment management system.
- *  Version:       1.0
+ *  Version:       1.1
  *  Author URI:    https://yamiru.com
  *  License:       MIT
  *  License URI:   https://opensource.org/licenses/MIT
@@ -440,6 +440,21 @@ class DatabaseRepository
      */
     public function getStats(): array
     {
+        // 60-sec file cache
+        $cacheDir = dirname(__DIR__) . '/data';
+        $cacheFile = $cacheDir . '/.stats_cache.json';
+        $cacheTtl = 60;
+
+        if (is_file($cacheFile) && (time() - filemtime($cacheFile)) < $cacheTtl) {
+            $cached = @file_get_contents($cacheFile);
+            if ($cached !== false) {
+                $decoded = json_decode($cached, true);
+                if (is_array($decoded)) {
+                    return $decoded;
+                }
+            }
+        }
+
         $tables = ['bans', 'mutes', 'warnings', 'kicks'];
         $stats = [];
         $currentTime = time();
@@ -475,7 +490,12 @@ class DatabaseRepository
                 }
             }
         }
-        
+
+        // cache
+        if (is_dir($cacheDir) && is_writable($cacheDir)) {
+            @file_put_contents($cacheFile, json_encode($stats), LOCK_EX);
+        }
+
         return $stats;
     }
     
