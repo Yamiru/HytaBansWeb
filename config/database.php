@@ -6,7 +6,7 @@
  *
  *  Plugin Name:   HytaBansWeb
  *  Description:   A modern, secure, and responsive web interface for HytaBans punishment management system.
- *  Version:       1.0
+ *  Version:       1.1
  *  Author URI:    https://yamiru.com
  *  License:       MIT
  *  License URI:   https://opensource.org/licenses/MIT
@@ -99,7 +99,8 @@ class DatabaseConfig
             \PDO::ATTR_EMULATE_PREPARES => false,
             $this->getMysqlInitCommandAttribute() => "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
             \PDO::ATTR_TIMEOUT => 30,
-            \PDO::ATTR_PERSISTENT => false,
+            // enabled persistent
+            \PDO::ATTR_PERSISTENT => true,
         ];
     }
     
