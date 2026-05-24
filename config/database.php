@@ -6,7 +6,7 @@
  *
  *  Plugin Name:   HytaBansWeb
  *  Description:   A modern, secure, and responsive web interface for HytaBans punishment management system.
- *  Version:       1.1
+ *  Version:       1.2
  *  Author URI:    https://yamiru.com
  *  License:       MIT
  *  License URI:   https://opensource.org/licenses/MIT
